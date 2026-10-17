@@ -272,8 +272,9 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
     processingOutcome match {
       case acc: ProcessingOutcome.Accepted =>
         log.debug(s"Unconfirmed transaction $tx added to the memory pool")
-        val newVault = vault().scanOffchain(tx)
-        updateNodeView(updatedVault = Some(newVault), updatedMempool = Some(newPool))
+        // The wallet derives off-chain state from the mempool on demand, reacting to the published
+        // ChangedMempool event, so there is no need to scan the transaction into the wallet here.
+        updateNodeView(updatedMempool = Some(newPool))
         context.system.eventStream.publish(SuccessfulTransaction(acc.tx))
       case i: ProcessingOutcome.Invalidated =>
         val e = i.e
@@ -736,6 +737,31 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
       sender() ! healthCheckReply
   }
 
+  private def resetBlockchainToHeight(targetHeight: Int): Try[String] = {
+    val currentHeight = history().headersHeight
+    history().resetToHeight(targetHeight).flatMap { newHistory =>
+      history().bestHeaderIdAtHeight(targetHeight) match {
+        case Some(targetHeaderId) =>
+          val targetVersion = idToVersion(targetHeaderId)
+          minimalState().rollbackTo(targetVersion).map { newState =>
+            val newVault = vault().rollback(targetVersion).getOrElse(vault())
+            updateNodeView(Some(newHistory), Some(newState.asInstanceOf[State]), Some(newVault))
+            context.system.eventStream.publish(Rollback(targetHeaderId))
+            s"Blockchain successfully reset from height $currentHeight to height ${newHistory.headersHeight}. All block sections and validity indices cleaned to ensure proper revalidation."
+          }
+        case None =>
+          updateNodeView(updatedHistory = Some(newHistory))
+          Success(s"Blockchain successfully reset from height $currentHeight to height ${newHistory.headersHeight}. All block sections and validity indices cleaned to ensure proper revalidation.")
+      }
+    }
+  }
+
+  private def handleBlockchainReset: Receive = {
+    case ResetBlockchainTo(height) =>
+      log.info(s"Received request to reset blockchain to height $height")
+      sender() ! resetBlockchainToHeight(height)
+  }
+
   override def receive: Receive =
     processRemoteModifiers orElse
       processLocallyGeneratedModifiers orElse
@@ -743,7 +769,8 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
       getCurrentInfo orElse
       getNodeViewChanges orElse
       processStateSnapshot orElse
-      handleHealthCheck orElse {
+      handleHealthCheck orElse
+      handleBlockchainReset orElse {
         case a: Any => log.error("Strange input: " + a)
       }
 
@@ -806,6 +833,7 @@ object ErgoNodeViewHolder {
     sealed trait HealthCheckResult
     case object ChainIsHealthy extends HealthCheckResult
     case class ChainIsStuck(reason: String) extends HealthCheckResult
+    case class ResetBlockchainTo(height: Int)
   }
 
   case class BlockAppliedTransactions(txs: Seq[ModifierId]) extends NodeViewHolderEvent

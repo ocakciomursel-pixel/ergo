@@ -1,0 +1,58 @@
+name: CI Verify Batch 6B Matrix
+on:
+  push:
+    branches:
+      - ci-verify-ergo-batch6b
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "#1631 LDBVersionedStore keepVersions=0"
+            branch: fix-1631-keep-versions-zero
+            cmd: sbt "avldb/testOnly scorex.db.LDBVersionedStoreSpec"
+          - name: "#1633 Set log level from config"
+            branch: fix-1633-set-loglevel-from-conf
+            cmd: sbt "testOnly org.ergoplatform.settings.ErgoSettingsSpecification"
+          - name: "#1614 UtxoState proofs immutability"
+            branch: fix-1614-proofs-for-transactions-immutability-test
+            cmd: sbt "testOnly org.ergoplatform.nodeView.state.UtxoStateSpecification"
+          - name: "#1870 Unspent boxes height slicing"
+            branch: fix-1870-unspent-boxes-height-slicing
+            cmd: sbt "testOnly org.ergoplatform.nodeView.wallet.persistence.WalletRegistrySpec org.ergoplatform.http.routes.WalletApiRouteSpec org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec"
+          - name: "#1363 Refresh expired mining candidate"
+            branch: fix-1363-refresh-expired-mining-candidate
+            cmd: sbt "testOnly org.ergoplatform.mining.CandidateGeneratorSpec"
+          - name: "#1154 Persist unconfirmed wallet txs"
+            branch: fix-1154-persist-unconfirmed-wallet-txs
+            cmd: sbt "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletSpec org.ergoplatform.nodeView.wallet.persistence.WalletStorageSpec"
+          - name: "#1905 Filter payments scan boxes"
+            branch: fix-1905-filter-payments-scan-boxes
+            cmd: sbt "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec"
+          - name: "#1884 Fee estimation bounds"
+            branch: fix-1884-fee-estimation-bounds
+            cmd: sbt "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolSpec"
+          - name: "#1556 Extract cleanup worker logic"
+            branch: fix-1556-extract-cleanup-worker-logic
+            cmd: sbt "testOnly org.ergoplatform.local.CleanupWorkerSpec"
+          - name: "#962 Save node version in extension"
+            branch: fix-962-save-node-version-in-extension
+            cmd: sbt "testOnly org.ergoplatform.mining.CandidateGeneratorSpec"
+          - name: "#2213 Unite P2S and P2SH routes"
+            branch: fix-2213-unite-p2s-p2sh-routes
+            cmd: sbt "testOnly org.ergoplatform.http.routes.ScriptApiRouteSpec"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+          cache: 'sbt'
+      - uses: sbt/setup-sbt@v1
+      - name: Run test
+        run: ${{ matrix.cmd }}

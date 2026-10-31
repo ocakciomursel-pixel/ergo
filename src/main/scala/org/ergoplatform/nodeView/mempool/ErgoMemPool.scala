@@ -380,8 +380,10 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
             case utxo: UtxoState =>
               // Allow proceeded transaction to spend outputs of pooled transactions.
               val utxoWithPool = utxo.withUnconfirmedTransactions(getAll)
-              val resolvedInputs = tx.inputIds.map(utxoWithPool.boxById)
-              if (resolvedInputs.forall(_.isDefined)) {
+              val allInputsAvailable =
+                (tx.inputIds.iterator ++ tx.dataInputs.iterator.map(_.boxId))
+                  .forall(id => utxoWithPool.boxById(id).isDefined)
+              if (allInputsAvailable) {
 
                 if (outputsContainReemissionToken(tx.outputCandidates, utxo.stateContext)) {
                   log.info(s"Mempool rejecting transaction with reemission token: ${tx.id}")

@@ -1,7 +1,7 @@
 package org.ergoplatform.nodeView.mempool
 
 import org.ergoplatform.modifiers.history.header.Header
-import org.ergoplatform.{ErgoBoxCandidate, Input}
+import org.ergoplatform.{DataInput, ErgoBoxCandidate, Input}
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolUtils.{ProcessingOutcome, SortingOption}
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
 import org.ergoplatform.nodeView.state.wrapped.WrappedUtxoState
@@ -722,6 +722,66 @@ class ErgoMemPoolSpec extends AnyFlatSpec
     outcome.isInstanceOf[ProcessingOutcome.Declined] shouldBe true
     outcome.asInstanceOf[ProcessingOutcome.Declined]
       .e.getMessage.contains("not all utxos in place yet") shouldBe true
+  }
+
+  it should "decline transaction with present regular inputs and missing data input, while validating available data inputs" in {
+    val (us, bh) = createUtxoState(settings)
+    val genesis = validFullBlock(None, us, bh)
+    val wus = WrappedUtxoState(us, bh, settings).applyModifier(genesis)(_ => ()).get
+
+    val feeProp = settings.chainSettings.monetary.feeProposition
+    val trueBoxes = wus.takeBoxes(100).filter(_.ergoTree == TrueTree).take(2)
+    trueBoxes.size shouldBe 2
+    val inputBox = trueBoxes.head
+    val availableDataBox = trueBoxes(1)
+    wus.boxById(inputBox.id).isDefined shouldBe true
+    wus.boxById(availableDataBox.id).isDefined shouldBe true
+
+    val fakeDataBoxId: org.ergoplatform.ErgoBox.BoxId =
+      ADKey @@ scorex.util.Random.randomBytes(32)
+    wus.boxById(fakeDataBoxId) shouldBe None
+
+    val feeOut = new ErgoBoxCandidate(inputBox.value, feeProp, creationHeight = 0)
+    val missingDataTx = ErgoTransaction(
+      IndexedSeq(new Input(inputBox.id, emptyProverResult)),
+      IndexedSeq(DataInput(fakeDataBoxId)),
+      IndexedSeq(feeOut)
+    )
+
+    val pool0 = ErgoMemPool.empty(settings)
+    val (poolAfterMissing, missingOutcome) =
+      pool0.process(UnconfirmedTransaction(missingDataTx, None), wus)
+    missingOutcome shouldBe a[ProcessingOutcome.Declined]
+    val declined = missingOutcome.asInstanceOf[ProcessingOutcome.Declined]
+    declined.reason shouldBe ProcessingOutcome.DeclineReason.MissingInputs
+    declined.e.getMessage should include("not all utxos in place yet")
+    declined.retainPersistedWalletTx shouldBe true
+    poolAfterMissing.isInvalidated(missingDataTx.id) shouldBe false
+
+    // Available-data-box control (valid): same present regular input with an available data box is accepted.
+    val validAvailableDataTx = ErgoTransaction(
+      IndexedSeq(new Input(inputBox.id, emptyProverResult)),
+      IndexedSeq(DataInput(availableDataBox.id)),
+      IndexedSeq(feeOut)
+    )
+    val (poolAfterValid, validOutcome) =
+      pool0.process(UnconfirmedTransaction(validAvailableDataTx, None), wus)
+    validOutcome shouldBe a[ProcessingOutcome.Accepted]
+    poolAfterValid.contains(validAvailableDataTx.id) shouldBe true
+
+    // Available-data-box control (invalid): present regular input with an available data box reaches
+    // statefulValidity and fails as Invalidated rather than MissingInputs.
+    val inflatedOut = new ErgoBoxCandidate(inputBox.value + 1L, feeProp, creationHeight = 0)
+    val invalidAvailableDataTx = ErgoTransaction(
+      IndexedSeq(new Input(inputBox.id, emptyProverResult)),
+      IndexedSeq(DataInput(availableDataBox.id)),
+      IndexedSeq(inflatedOut)
+    )
+    val (poolAfterInvalid, invalidOutcome) =
+      pool0.process(UnconfirmedTransaction(invalidAvailableDataTx, None), wus)
+    invalidOutcome shouldBe a[ProcessingOutcome.Invalidated]
+    invalidOutcome.retainPersistedWalletTx shouldBe false
+    poolAfterInvalid.isInvalidated(invalidAvailableDataTx.id) shouldBe true
   }
 
   it should "replace multiple double-spending transactions when new one pays more" in {

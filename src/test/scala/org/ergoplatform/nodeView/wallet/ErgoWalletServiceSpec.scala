@@ -948,5 +948,387 @@ class ErgoWalletServiceSpec
       }
     }
   }
+
+  property("ScanOffChain pre-write storage failure keeps live off-chain spend while cold reopen with empty mempool reflects durable storage (with successful-write control)") {
+    val rootDir = createTempDir
+    val timeoutDuration = scala.concurrent.duration.Duration(10, "seconds")
+
+    def openStoresUnder(dir: File): Vector[File] = {
+      val normalized = dir.toPath.toAbsolutePath.normalize()
+      val registry = scorex.db.LDBFactory.factory.asInstanceOf[scorex.db.StoreRegistry]
+      registry.lock.readLock().lock()
+      try {
+        registry.map.keysIterator.filter { path =>
+          path.toPath.toAbsolutePath.normalize().startsWith(normalized)
+        }.toVector
+      } finally registry.lock.readLock().unlock()
+    }
+
+    def closeStoresUnder(dir: File): Unit = {
+      val normalized = dir.toPath.toAbsolutePath.normalize()
+      val registry = scorex.db.LDBFactory.factory.asInstanceOf[scorex.db.StoreRegistry]
+      registry.lock.writeLock().lock()
+      try {
+        val matching = registry.map.toVector.collect {
+          case (path, store) if path.toPath.toAbsolutePath.normalize().startsWith(normalized) =>
+            path -> store
+        }
+        matching.foreach { case (path, store) =>
+          store.close()
+          registry.map.remove(path)
+        }
+      } finally registry.lock.writeLock().unlock()
+    }
+
+    case class CaseOutcome(
+      confirmedInputId: String,
+      unconfirmedChangeId: String,
+      spendingTxId: scorex.util.ModifierId,
+      liveStatus: ErgoWalletActorMessages.WalletStatus,
+      liveUnspentIds: Seq[String],
+      liveOffChainBalance: Long,
+      liveCollectHalfInput: Boolean,
+      storedRecordsBeforeShutdown: Seq[(scorex.util.ModifierId, Int)],
+      livePendingIdsToRestore: Seq[scorex.util.ModifierId],
+      reopenedStatus: ErgoWalletActorMessages.WalletStatus,
+      reopenedPendingIdsToRestore: Seq[scorex.util.ModifierId],
+      reopenedUnspentIds: Seq[String],
+      reopenedOffChainBalance: Long,
+      reopenedCollectHalfInput: Boolean
+    )
+
+    def runCase(caseName: String, failFirstUnconfirmedWrite: Boolean): CaseOutcome = {
+      val caseDir = new File(rootDir, caseName)
+      val caseSettings = settings.copy(directory = caseDir.getAbsolutePath)
+      val walletService = new ErgoWalletServiceImpl(caseSettings)
+      val selector = new ReplaceCompactCollectBoxSelector(
+        caseSettings.walletSettings.maxInputs,
+        caseSettings.walletSettings.optimalInputs,
+        None
+      )
+      val actorSystem = akka.actor.ActorSystem(
+        s"scan-offchain-prewrite-$caseName-" + java.util.UUID.randomUUID().toString
+      )
+      try {
+        val registry1 = WalletRegistry.apply(caseSettings).get
+        val confirmedInput = TrackedBox(
+          creationTxId = modifierIdGen.sample.get,
+          creationOutIndex = 0,
+          inclusionHeightOpt = Some(1),
+          spendingTxIdOpt = None,
+          spendingHeightOpt = None,
+          box = testBox(1000000000L, pks.head.script, 1),
+          scans = Set(PaymentsScanId)
+        )
+        registry1.updateOnBlock(
+          ScanResults(Seq(confirmedInput), ArraySeq.empty, ArraySeq.empty),
+          modifierIdGen.sample.get,
+          blockHeight = 1
+        ).get
+
+        val spendingTx = ErgoTransaction(
+          IndexedSeq(Input(confirmedInput.box.id, emptyProverResult)),
+          IndexedSeq(
+            new ErgoBoxCandidate(400000000L, pks.head.script, creationHeight = 1),
+            new ErgoBoxCandidate(600000000L, TrueTree, creationHeight = 1)
+          )
+        )
+        val confirmedInputId = Base16.encode(confirmedInput.box.id)
+        val unconfirmedChangeId = Base16.encode(spendingTx.outputs.head.id)
+
+        val storageFolder = WalletStorage.storageFolder(caseSettings)
+        storageFolder.mkdirs()
+        val dbOpts = new org.iq80.leveldb.Options()
+        dbOpts.createIfMissing(true)
+        val rawStorageDb = scorex.db.LDBFactory.factory.open(storageFolder, dbOpts)
+        val injectPreWriteFailure =
+          new java.util.concurrent.atomic.AtomicBoolean(failFirstUnconfirmedWrite)
+        val kvStore1 = new LDBKVStore(rawStorageDb) {
+          override def insert(id: K, value: V): scala.util.Try[Unit] = {
+            if (id.startsWith(WalletStorage.UnconfirmedTxPrefixArray) &&
+              injectPreWriteFailure.compareAndSet(true, false)) {
+              scala.util.Failure(
+                new java.io.IOException("injected pre-write failure before pending record")
+              )
+            } else {
+              super.insert(id, value)
+            }
+          }
+        }
+        val storage1 = new WalletStorage(kvStore1, caseSettings)
+        val initialState1 = ErgoWalletState(
+          storage1,
+          secretStorageOpt = None,
+          registry1,
+          OffChainRegistry.init(registry1),
+          outputsFilter = None,
+          WalletVars.apply(storage1, caseSettings),
+          stateReaderOpt = None,
+          mempoolReaderOpt = None,
+          utxoStateReaderOpt = None,
+          parameters,
+          maxInputsToUse = caseSettings.walletSettings.maxInputs,
+          rescanInProgress = false
+        )
+
+        val probe = akka.testkit.TestProbe()(actorSystem)
+        val actor1 = actorSystem.actorOf(akka.actor.Props(new ErgoWalletActor(
+          caseSettings, parameters, walletService, selector, null
+        ) {
+          override def preStart(): Unit = self ! ErgoWalletActorMessages.ReadWallet(initialState1)
+        }))
+
+        probe.send(actor1, ErgoWalletActorMessages.GetWalletStatus)
+        val baselineStatus = probe.expectMsgType[ErgoWalletActorMessages.WalletStatus](timeoutDuration)
+        baselineStatus.error shouldBe None
+        baselineStatus.height shouldBe 1
+
+        probe.send(actor1, ErgoWalletActorMessages.ScanOffChain(spendingTx))
+
+        probe.send(actor1, ErgoWalletActorMessages.GetWalletStatus)
+        val liveStatus = probe.expectMsgType[ErgoWalletActorMessages.WalletStatus](timeoutDuration)
+
+        probe.send(
+          actor1,
+          ErgoWalletActorMessages.GetWalletBoxes(unspentOnly = true, considerUnconfirmed = true)
+        )
+        val liveBoxes = probe.expectMsgType[Seq[WalletBox]](timeoutDuration)
+        val liveUnspentIds = liveBoxes.map(wb => Base16.encode(wb.trackedBox.box.id))
+
+        probe.send(
+          actor1,
+          ErgoWalletActorMessages.ReadBalances(org.ergoplatform.wallet.boxes.ChainStatus.OffChain)
+        )
+        val liveOffChainDigest =
+          probe.expectMsgType[org.ergoplatform.nodeView.wallet.persistence.WalletDigest](timeoutDuration)
+
+        probe.send(actor1, ErgoWalletActorMessages.CollectWalletBoxes(500000000L, Map.empty))
+        val liveCollect =
+          probe.expectMsgType[ErgoWalletActorMessages.ReqBoxesResponse](timeoutDuration)
+
+        probe.send(actor1, ErgoWalletActorMessages.ReadUnconfirmedTransactions)
+        val livePending = probe.expectMsgType[Seq[ErgoTransaction]](timeoutDuration)
+        val storedBeforeShutdown =
+          storage1.readUnconfirmedTransactions().map { case (tx, h) => tx.id -> h }
+        injectPreWriteFailure.get() shouldBe false
+
+        // Cold close: stop actor1 via CloseWallet and verify no LevelDB handles remain open.
+        probe.watch(actor1)
+        probe.send(actor1, ErgoWalletActorMessages.CloseWallet)
+        probe.expectTerminated(actor1, timeoutDuration)
+        openStoresUnder(caseDir) shouldBe empty
+
+        // Cold reopen with an empty mempool (mempoolReaderOpt = None) and no intervening retry or
+        // reannouncement, using unmodified ErgoWalletActor.preStart() against the on-disk stores.
+        val actor2 = actorSystem.actorOf(
+          akka.actor.Props(classOf[ErgoWalletActor], caseSettings, parameters, walletService, selector, null)
+        )
+
+        probe.send(actor2, ErgoWalletActorMessages.GetWalletStatus)
+        val reopenedStatus = probe.expectMsgType[ErgoWalletActorMessages.WalletStatus](timeoutDuration)
+
+        probe.send(actor2, ErgoWalletActorMessages.ReadUnconfirmedTransactions)
+        val reopenedPending = probe.expectMsgType[Seq[ErgoTransaction]](timeoutDuration)
+
+        probe.send(
+          actor2,
+          ErgoWalletActorMessages.GetWalletBoxes(unspentOnly = true, considerUnconfirmed = true)
+        )
+        val reopenedBoxes = probe.expectMsgType[Seq[WalletBox]](timeoutDuration)
+        val reopenedUnspentIds = reopenedBoxes.map(wb => Base16.encode(wb.trackedBox.box.id))
+
+        probe.send(
+          actor2,
+          ErgoWalletActorMessages.ReadBalances(org.ergoplatform.wallet.boxes.ChainStatus.OffChain)
+        )
+        val reopenedOffChainDigest =
+          probe.expectMsgType[org.ergoplatform.nodeView.wallet.persistence.WalletDigest](timeoutDuration)
+
+        probe.send(actor2, ErgoWalletActorMessages.CollectWalletBoxes(500000000L, Map.empty))
+        val reopenedCollect =
+          probe.expectMsgType[ErgoWalletActorMessages.ReqBoxesResponse](timeoutDuration)
+
+        probe.watch(actor2)
+        probe.send(actor2, ErgoWalletActorMessages.CloseWallet)
+        probe.expectTerminated(actor2, timeoutDuration)
+        openStoresUnder(caseDir) shouldBe empty
+
+        CaseOutcome(
+          confirmedInputId = confirmedInputId,
+          unconfirmedChangeId = unconfirmedChangeId,
+          spendingTxId = spendingTx.id,
+          liveStatus = liveStatus,
+          liveUnspentIds = liveUnspentIds,
+          liveOffChainBalance = liveOffChainDigest.walletBalance,
+          liveCollectHalfInput = liveCollect.result.isSuccess,
+          storedRecordsBeforeShutdown = storedBeforeShutdown,
+          livePendingIdsToRestore = livePending.map(_.id),
+          reopenedStatus = reopenedStatus,
+          reopenedPendingIdsToRestore = reopenedPending.map(_.id),
+          reopenedUnspentIds = reopenedUnspentIds,
+          reopenedOffChainBalance = reopenedOffChainDigest.walletBalance,
+          reopenedCollectHalfInput = reopenedCollect.result.isSuccess
+        )
+      } finally {
+        try scala.concurrent.Await.result(actorSystem.terminate(), scala.concurrent.duration.Duration(15, "seconds"))
+        finally closeStoresUnder(caseDir)
+      }
+    }
+
+    try {
+      val failed = runCase("pre-write-failure", failFirstUnconfirmedWrite = true)
+      val control = runCase("successful-write-control", failFirstUnconfirmedWrite = false)
+
+      // 1. Live off-chain view: both cases adopt newState so the in-flight input cannot be
+      //    double-spent in the running session, while pre-write failure surfaces WalletStatus.error.
+      failed.liveUnspentIds shouldBe Seq(failed.unconfirmedChangeId)
+      control.liveUnspentIds shouldBe Seq(control.unconfirmedChangeId)
+      failed.liveOffChainBalance shouldBe 400000000L
+      control.liveOffChainBalance shouldBe 400000000L
+      failed.liveCollectHalfInput shouldBe false
+      control.liveCollectHalfInput shouldBe false
+      failed.liveStatus.error.value should include(
+        s"Could not store unconfirmed transaction ${failed.spendingTxId}"
+      )
+      failed.liveStatus.error.value should include("injected pre-write failure before pending record")
+      control.liveStatus.error shouldBe None
+
+      // 2. Stored record before shutdown: empty on pre-write failure vs persisted in control.
+      failed.storedRecordsBeforeShutdown shouldBe empty
+      failed.livePendingIdsToRestore shouldBe empty
+      control.storedRecordsBeforeShutdown shouldBe Seq(control.spendingTxId -> 0)
+      control.livePendingIdsToRestore shouldBe Seq(control.spendingTxId)
+
+      // 3. Cold reopen with empty mempool and no intervening retry or reannouncement:
+      //    pre-write failure falls back to durable WalletRegistry on-chain state, whereas the
+      //    successful-write control rebuilds the off-chain spend from durable WalletStorage.
+      failed.reopenedStatus.error shouldBe None
+      failed.reopenedPendingIdsToRestore shouldBe empty
+      failed.reopenedUnspentIds shouldBe Seq(failed.confirmedInputId)
+      failed.reopenedOffChainBalance shouldBe 1000000000L
+      failed.reopenedCollectHalfInput shouldBe true
+
+      control.reopenedStatus.error shouldBe None
+      control.reopenedPendingIdsToRestore shouldBe Seq(control.spendingTxId)
+      control.reopenedUnspentIds shouldBe Seq(control.unconfirmedChangeId)
+      control.reopenedOffChainBalance shouldBe 400000000L
+      control.reopenedCollectHalfInput shouldBe false
+    } finally {
+      try closeStoresUnder(rootDir)
+      finally deleteRecursive(rootDir)
+    }
+  }
+
+  property("refreshOffChainState preserves live in-mempool spend when an unrelated stored transaction is forgotten after a pre-write save failure") {
+    withVersionedStore(2) { versionedStore =>
+      withStore { rawStore =>
+        val actorSystem = akka.actor.ActorSystem(
+          "refresh-offchain-live-mempool-" + java.util.UUID.randomUUID().toString
+        )
+        val timeoutDuration = scala.concurrent.duration.Duration(10, "seconds")
+        try {
+          val boxStored = TrackedBox(
+            creationTxId = modifierIdGen.sample.get,
+            creationOutIndex = 0,
+            inclusionHeightOpt = Some(1),
+            spendingTxIdOpt = None,
+            spendingHeightOpt = None,
+            box = testBox(1000000000L, pks.head.script, 1),
+            scans = Set(PaymentsScanId)
+          )
+          val boxUnstored = TrackedBox(
+            creationTxId = modifierIdGen.sample.get,
+            creationOutIndex = 0,
+            inclusionHeightOpt = Some(1),
+            spendingTxIdOpt = None,
+            spendingHeightOpt = None,
+            box = testBox(2000000000L, pks.head.script, 1),
+            scans = Set(PaymentsScanId)
+          )
+          val storedTx = ErgoTransaction(
+            IndexedSeq(Input(boxStored.box.id, emptyProverResult)),
+            IndexedSeq(new ErgoBoxCandidate(boxStored.box.value, TrueTree, creationHeight = 1))
+          )
+          val unstoredLiveTx = ErgoTransaction(
+            IndexedSeq(Input(boxUnstored.box.id, emptyProverResult)),
+            IndexedSeq(
+              new ErgoBoxCandidate(500000000L, pks.head.script, creationHeight = 1),
+              new ErgoBoxCandidate(1500000000L, TrueTree, creationHeight = 1)
+            )
+          )
+
+          val failKey = WalletStorage.unconfirmedTxKey(unstoredLiveTx.id)
+          val faultStore = new LDBKVStore(null) {
+            override def insert(id: K, value: V): scala.util.Try[Unit] =
+              if (java.util.Arrays.equals(id, failKey)) {
+                scala.util.Failure(new java.io.IOException("pre-write failure for unstoredLiveTx"))
+              } else rawStore.insert(id, value)
+            override def insert(keys: Array[K], values: Array[V]): scala.util.Try[Unit] =
+              rawStore.insert(keys, values)
+            override def update(toInsertKeys: Array[K], toInsertValues: Array[V], toRemove: Array[K]): scala.util.Try[Unit] =
+              rawStore.update(toInsertKeys, toInsertValues, toRemove)
+            override def remove(keys: Array[K]): scala.util.Try[Unit] = rawStore.remove(keys)
+            override def get(key: K): Option[V] = rawStore.get(key)
+            override def getRange(start: K, end: K, limit: Int): Array[(K, V)] =
+              rawStore.getRange(start, end, limit)
+            override def close(): Unit = ()
+          }
+
+          val base = initialState(faultStore, versionedStore)
+          base.registry.updateOnBlock(
+            ScanResults(Seq(boxStored, boxUnstored), ArraySeq.empty, ArraySeq.empty),
+            modifierIdGen.sample.get,
+            blockHeight = 1
+          ).get
+          val state0 = base.copy(offChainRegistry = OffChainRegistry.init(base.registry))
+          val service = new ErgoWalletServiceImpl(settings) {
+            override def readWallet(
+              state: ErgoWalletState,
+              mnemonic: Option[SecretString],
+              keys: Option[Int],
+              secretSettings: org.ergoplatform.wallet.settings.SecretStorageSettings
+            ): ErgoWalletState = state
+          }
+
+          val ref = actorSystem.actorOf(akka.actor.Props(new ErgoWalletActor(
+            settings, parameters, service, null, null
+          ) {
+            override def preStart(): Unit = self ! ErgoWalletActorMessages.ReadWallet(state0)
+          }))
+          val probe = akka.testkit.TestProbe()(actorSystem)
+
+          probe.send(ref, ErgoWalletActorMessages.ScanOffChain(storedTx))
+          probe.send(ref, ErgoWalletActorMessages.ScanOffChain(unstoredLiveTx))
+          probe.send(
+            ref,
+            org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.ChangedMempool(
+              new FakeMempool(Seq(UnconfirmedTransaction(unstoredLiveTx, None)))
+            )
+          )
+          probe.send(ref, ErgoWalletActorMessages.ForgetUnconfirmedTransactions(Seq(storedTx.id)))
+          probe.send(
+            ref,
+            ErgoWalletActorMessages.GetWalletBoxes(unspentOnly = true, considerUnconfirmed = true)
+          )
+          val remainingIds = probe
+            .expectMsgType[Seq[WalletBox]](timeoutDuration)
+            .map(wb => Base16.encode(wb.trackedBox.box.id))
+            .toSet
+
+          remainingIds shouldBe Set(
+            Base16.encode(boxStored.box.id),
+            Base16.encode(unstoredLiveTx.outputs.head.id)
+          )
+          state0.storage.unconfirmedTransactionHeights shouldBe empty
+
+          probe.watch(ref)
+          actorSystem.stop(ref)
+          probe.expectTerminated(ref)
+        } finally {
+          scala.concurrent.Await.result(actorSystem.terminate(), scala.concurrent.duration.Duration(15, "seconds"))
+        }
+      }
+    }
+  }
 }
 

@@ -258,18 +258,30 @@ class ErgoWalletActor(settings: ErgoSettings,
       }
 
     /* SCAN COMMANDS */
-    //scan mempool transaction
+    // Scan mempool transaction. Persistence to WalletStorage is best-effort: ScanOffChain runs
+    // after the transaction is accepted into the live mempool, so newState is still adopted on a
+    // storage write failure to keep the running session's off-chain view consistent and avoid
+    // offering in-flight inputs for double-spending, while surfacing the failure in WalletStatus.
+    // If no pending record was written before a cold restart into an empty mempool (with no retry
+    // or reannouncement), restoreOffChainState rebuilds only from durable WalletStorage records.
     case ScanOffChain(tx) =>
       val (newState, walletAffected) = ergoWalletService.scanOffChainUpdate(state, tx)
-      if (walletAffected) {
+      val nextState = if (walletAffected) {
         // the transaction is kept until it gets on the blockchain, so that a restart in the meantime
         // does not make the wallet consider its inputs spendable again
         state.storage.addUnconfirmedTransaction(tx, state.fullHeight) match {
           case Success(_) =>
-          case Failure(t) => log.error(s"Could not store unconfirmed transaction ${tx.id}: ", t)
+            newState
+          case Failure(t) =>
+            val details = Option(t.getMessage).filter(_.nonEmpty).getOrElse(t.getClass.getSimpleName)
+            val errorMsg = s"Could not store unconfirmed transaction ${tx.id}: $details"
+            log.error(errorMsg, t)
+            newState.copy(error = Some(errorMsg))
         }
+      } else {
+        newState
       }
-      context.become(loadedWallet(newState))
+      context.become(loadedWallet(nextState))
 
     case ReadUnconfirmedTransactions =>
       sender() ! unconfirmedTransactionsToRestore(state)
@@ -284,7 +296,7 @@ class ErgoWalletActor(settings: ErgoSettings,
           ErgoWalletActor.collectWithDescendants(storedTxs, unconfirmedToForget)
         val existingToForget = cascaded.intersect(storedIds).toSeq
         if (existingToForget.nonEmpty && forgetUnconfirmedTransactions(state, existingToForget)) {
-          context.become(loadedWallet(refreshOffChainState(state)))
+          context.become(loadedWallet(refreshOffChainState(state, excludedIds = cascaded)))
         }
       }
 
@@ -315,11 +327,12 @@ class ErgoWalletActor(settings: ErgoSettings,
             self ! ScanInThePast(blockHeight + 1, rescan)
           } else if (rescan) {
             log.info(s"Rescanning finished at height $blockHeight")
-            val refreshedState = if (nextState.storage.unconfirmedTransactionHeights.nonEmpty) {
-              refreshOffChainState(nextState)
-            } else {
-              nextState
-            }
+            val refreshedState =
+              if (nextState.storage.unconfirmedTransactionHeights.nonEmpty || nextState.mempoolReaderOpt.nonEmpty) {
+                refreshOffChainState(nextState)
+              } else {
+                nextState
+              }
             context.become(loadedWallet(refreshedState.copy(rescanInProgress = false)))
           }
         }
@@ -563,8 +576,38 @@ class ErgoWalletActor(settings: ErgoSettings,
     sender() ! txsToSend
   }
 
-  private def refreshOffChainState(state: ErgoWalletState): ErgoWalletState =
-    ergoWalletService.restoreOffChainState(state.copy(offChainRegistry = OffChainRegistry.init(state.registry)))
+  private def refreshOffChainState(state: ErgoWalletState,
+                                   excludedIds: Set[ModifierId] = Set.empty): ErgoWalletState = {
+    val fromStorage = ergoWalletService.restoreOffChainState(
+      state.copy(offChainRegistry = OffChainRegistry.init(state.registry))
+    )
+    state.mempoolReaderOpt match {
+      case None =>
+        fromStorage
+      case Some(mempool) =>
+        val poolTxs = mempool.getAllPrioritized.map(_.transaction)
+        if (poolTxs.isEmpty) {
+          fromStorage
+        } else {
+          val storedIds = fromStorage.storage.unconfirmedTransactionHeights.keySet
+          val deadIds = ErgoWalletActor.collectWithDescendants(poolTxs, excludedIds)
+          val liveUnstored = poolTxs.filterNot { tx =>
+            storedIds.contains(tx.id) ||
+              deadIds.contains(tx.id) ||
+              fromStorage.registry.getTx(tx.id).isDefined ||
+              tx.inputs.exists(in => fromStorage.registry.getBox(in.boxId).exists(_.spendingHeightOpt.isDefined)) ||
+              tx.dataInputs.exists(di => fromStorage.registry.getBox(di.boxId).exists(_.spendingHeightOpt.isDefined))
+          }
+          if (liveUnstored.isEmpty) {
+            fromStorage
+          } else {
+            ErgoWalletActor.orderByDependency(liveUnstored).foldLeft(fromStorage) { case (acc, tx) =>
+              ergoWalletService.scanOffChainUpdate(acc, tx)._1
+            }
+          }
+        }
+    }
+  }
 
   /**
     * Stored unconfirmed transactions worth putting back into the memory pool. Transactions already
@@ -672,7 +715,7 @@ class ErgoWalletActor(settings: ErgoSettings,
       if (toForget.nonEmpty) {
         forgetUnconfirmedTransactions(state, toForget)
       }
-      if (refreshOffChain) refreshOffChainState(state) else state
+      if (refreshOffChain) refreshOffChainState(state, excludedIds = confirmed ++ deadUnconfirmed) else state
     }
   }
 
